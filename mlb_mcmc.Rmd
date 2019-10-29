@@ -1,0 +1,700 @@
+---
+title: "Project"
+author: "Kentaro Kato (1851049)"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# At which age, baseball players can hit the biggest number of homeruns. 
+
+The goal of this project is to predict the age that brings the highest number of homeruns by using hierarchical Bayesian models. This time, I define homerun rate as the number of homeruns over the number of at-bats (the a player's turn at batting except for Walk or Hit-by-pitch). 
+
+On this project, I used MLB (Major League Baseball) data from the site https://www.retrosheet.org/gamelogs/index.html
+
+
+### Import libraries 
+```{r}
+set.seed(1234)
+library(dplyr)
+library(ggplot2)
+library(rstan)
+library(bayesplot)
+library(bridgesampling)
+```
+
+### Import data
+```{r}
+# This is data about batting 
+bat <- read.csv("input/Batting.csv", header = TRUE, stringsAsFactors = FALSE)
+bat <- as.data.frame(bat)
+dim(bat)
+
+# This is data about players
+players <- read.csv("input/People.csv", header = TRUE)
+dim(players)
+
+head(bat)
+```
+
+## Data Preprocessing
+
+As the goal I mentioned, we need only the data about age, homerun, and at-bat. In this section, I extract these data from original data.
+
+```{r}
+# Add "age" data to bat dataframe
+bat$birthYear <- players$birthYear[match(bat$playerID, players$playerID)]
+bat$age <- bat$yearID - bat$birthYear
+
+# Add PA(Plate Apearance) column 
+bat[is.na(bat)] <- 0
+bat$PA  <- bat$AB + bat$BB + bat$HBP + bat$SH + bat$SF # Plate Appearance
+
+# Get sum of total plate appearance for each player's baseball life
+bat <- bat %>% 
+  group_by(playerID) %>% 
+  mutate(PA_Carrer = sum(PA))
+
+# Cosinder only players born after 1960 and with more than 1000 PA in total
+new_bat <- subset(bat, birthYear > 1960 & PA_Carrer > 1000 )
+
+# Extract only playerID, AB, HR and age
+my_data <- new_bat %>%
+  select(playerID, AB, HR, age)
+head(my_data)
+```
+
+
+## Data Analysis
+
+Finally, we are ready to explore the dataset. 
+Before doing any bayesian analysis, we will take a look at the original data. 
+
+### Boxplot
+```{r}
+p_HR <- my_data %>%
+  mutate(rate = HR/AB)
+boxplot(rate ~ age, data = p_HR, outline=F)
+```
+
+### rate of homerun by age groups
+```{r}
+p_HR <- my_data %>% 
+  group_by(age) %>% 
+  mutate(num.HR = sum(HR)) %>% 
+  mutate(num.AB = sum(AB)) %>% 
+  mutate(rate = num.HR/num.AB) %>%
+  mutate(count = n())
+
+p_HR <- p_HR %>%
+  select(age, num.HR, num.AB, rate, count) %>%
+  distinct()
+
+p_HR <- as.data.frame(p_HR)
+p_HR <- p_HR[order(p_HR[,"age"]), ]
+p_HR <- select(p_HR, age, rate, count)
+rownames(p_HR) <- NULL
+head(p_HR)
+
+ggplot(p_HR, aes(x = age)) +
+  geom_point(aes(y = rate), stat = "identity") +
+  geom_line(aes(y = rate), stat = "identity", color = "black") +
+  geom_text(aes(y = rate, label = count), color = "blue", size = 2.5, vjust = -1)
+```
+
+According to the graph, at first, players 29 years old have quite high probability of homeruns. From 20 years old, the rate is slight increasing up to 30. After 30, it relatively remains at the similar level even if it suddenly go up to the top rate at age 40. But before concluding the relationship between ages and homeruns with this result, we have to deal with some concerns.
+
+
+##### 1) Differences among players are not considered
+
+It seems that players with aged between 35 and 40 likely hit as much homeruns as younger players. This occurs because ,around these age, most of players retire and only good players still play. 
+
+##### 2) There might be a big noise
+
+Look at the point of 40 years old. This is the highest point overall. It is hardly to imagine that 40-year-old players have the most strong power among all players to hit homeruns. There may be a prominent player who hit many homeruns with very few chances.
+
+##### 3) The number of data is different among ages
+
+For example, after the age 40, there are a few players because a lot of players retire before 40 years old. Thus, the distribution of these age is not trusted compared to other ages.
+
+##### Outstanding problems
+
+Shortly, we can see the problem at age 19, 40, 45.
+
+- at age 19, the probability is quite high while it is 0 at age 45. It may be because the number of data is small.
+
+- at age 40, the probability reaches suddenly top overall. We can guess that there are very prominent players although the other players, who has the same age, already retired.
+
+
+### Age mapping
+To implement the bayesian modeling, I arrange the number for each age. 
+
+```{r}
+# age mapping
+age.map <- data.frame(matrix(ncol = 2, nrow = 0))
+age_data <- sort(unique(my_data$age))
+for (i in 1:length(age_data)){
+  new <- data.frame(i, age_data[i])
+  age.map <- rbind(age.map, new)
+}
+colnames(age.map) <- c("num", "age")
+my_data$age.num <- age.map$num[match(my_data$age, age.map$age)]
+head(my_data)
+```
+
+
+# Hierarchical Bayesian models
+
+### Rstan
+
+Stan is a new-ish language that offers a more comprehensive approach to learning and implementing Bayesian models that can fit **complex data structures**.
+
+First, I tried to solve this problem by rjags, but it did not work because I have got some software problem which I can not fix by myself. That is why I decide to use Rstan not Rjapgs.
+
+
+A Stan program has three required "blocks" (other blocks, which is not required, exist as followed in next chunk):
+
+1. **data** block : where you declare the data types, their dimensions, any restrictions (i.e. upper = or lower = , which act as checks for Stan), and their names. Any names you give to your Stan program will also be the names used in other blocks.
+
+2. **parameter** block : This is where you indicate the parameters you want to model, their dimensions, restrictions, and name. For a linear regression, we will want to model the intercept, any slopes, and the standard deviation of the errors around the regression line.
+
+3. **model** block : This is where you include any sampling statements, including the ???likelihood??? (model) you are using. The model block is where you indicate any prior distributions you want to include for your parameters.
+
+To use Rstan, We need to set some parameters to run it.
+
+* **number of iterations**: 1000. The total lenghth of the Markov Chain. I set only 1000 because the effective sample sizes of most parameters are less than 1000. 
+
+* **number of chains**: 2
+
+* **warmup (aka burn-in)**: 200. The number of iterations to discard at the beginning
+
+```{r}
+# Rstan parameters 
+my.iter <- 1000
+my.warmup <- 500
+my.chains <- 2
+my.refresh <- my.iter/10
+num.lag <- my.iter/10 # for autocorrelation
+```
+
+### Data 
+
+This is the data for simulation
+```{r}
+my.data = list(N     = nrow(my_data), 
+              N_age = length(unique(my_data$age)), 
+              HR    = my_data$HR, 
+              AB    = my_data$AB, 
+              age   = my_data$age.num)
+```
+
+### Graph after MCMC
+
+I create a function to plot a graph after MCMC
+
+```{r}
+plot_graph <- function(fit){
+  # draw estimation (p_age)
+  p_age.summary <- summary(fit, pars = c("p_age"), 
+                            probs = c(0.025, 0.25, 0.5, 0.75, 0.975))$summary
+  p_age.summary <- p_age.summary[, c("2.5%", "25%","50%", "75%", "97.5%" )]
+  p_HR_graph <- cbind(p_HR, p_age.summary)
+  colnames(p_HR_graph) <- c("age", "p_data","count", "p_2.5", "p_25", "p_50", "p_75", "p_97.5")
+  a <- 2
+  a
+  
+  ggplot(p_HR_graph, aes(x = age)) + 
+    geom_point(aes(y = p_data), stat = "identity") + 
+    geom_line(aes(y = p_data), stat = "identity", color = "black") + 
+    geom_line(aes(y = p_2.5), stat = "identity", color = "red", alpha = 0.3) + 
+    geom_line(aes(y = p_25), stat = "identity", color = "red", alpha = 0.6) + 
+    geom_point(aes(y = p_50), stat = "identity", color = "red", alpha = 1) + 
+    geom_line(aes(y = p_50), stat = "identity", color = "red") + 
+    geom_line(aes(y = p_75), stat = "identity", color = "red", alpha = 0.6) +
+    geom_line(aes(y = p_97.5), stat = "identity", color = "red", alpha = 0.3)
+}
+```
+
+
+
+# Model 1 (Considering only age without beta)
+
+I define the first bayesian model cosidering only age below. 
+
+$$HR[i] \sim \mathrm{Binomial}(AB[i],p[i])$$
+$$p[i] = \mathrm{Logistic}(r_{age}[age[i]])$$ 
+
+$$\mathrm{where} \quad i = 1, 2, ..., N$$
+$$r_{age}[j] \sim \mathrm{Normal}(0,s_{age}) $$
+$$\mathrm{where} \quad j = 1, 2, ..., N_{age}$$
+
+The number of homeruns $HR$ follows binomial distribution with parameters the number of at-bats $AB$ and the probability of homeruns at age $i$. 
+
+Also the probability of homeruns at age $p_i$ follows logistic function with the variable depending on the age of the player $r_{age}$.
+
+And, I defined the factor of homerun depending on the ages $r_{age}$ follows normal distribution with mean is 0 and standard deviation is $s_{age}$
+
+### Logistic Regression
+
+Logistic Regression is used when the dependent variable(target) is binary number.
+In this case, I need to know whether the batter hit homerun (1) or not (0).
+
+
+
+```{r}
+# Model
+
+# The data block reads external information.
+# data {
+#     int N;
+#     int N_age;
+#     int HR[N];
+#     int AB[N];
+#     int age[N];
+# }
+# 
+# The parameters block defines the sampling space.
+# parameters {
+#     real<lower=0> s_age; # float
+#     vector[N_age] r_age;
+# }
+# 
+# The transformed parameters block allows for parameter processing before the posterior is computed.
+# transformed parameters {
+#     vector[N] p;
+# 
+#     for (i in 1:N)
+#         p[i] = inv_logit(r_age[age[i]]);
+# }
+# 
+# In the model block we define our posterior distributions.
+# model {
+#     r_age ~ normal(0, s_age);
+#     HR ~ binomial(AB, p);
+# }
+# 
+# The generated quantities block allows for postprocessing.
+# generated quantities {
+#     real p_age[N_age];
+#     for (i in 1:N_age)
+#         p_age[i] = inv_logit(r_age[i]);
+# }
+```
+
+
+
+```{r model_1}
+fit1 <- stan(file = "stanfile/model_1.stan", data = my.data, 
+            chains = my.chains, warmup = my.warmup, iter = my.iter,
+             cores = 2, refresh = my.refresh)
+```
+
+
+## Summary 1
+
+Now we can print the results of our model.
+
+```{r}
+list_of_draws <- rstan::extract(fit1)
+print(names(list_of_draws))
+```
+
+These are the parameters that we can see the trace from MCMC using Rstan. Let's take a look only $\beta$, $s_{age}$, $r_{age}$.
+
+### Statistics
+
+For models fit using MCMC, also included in the summary are the **mean**, the Monte Carlo standard error (**se_mean**), the standard deviation (**sd**), **quantiles** (2.5%, 25%, 50%, 75%, 97.5%) the effective sample size (**n_eff**), and the R-hat statistic (**Rhat**).
+
+* **se_mean**: The Monte Carlo standard error is the uncertainty about a statistic in the sample due to sampling error. The estimated standard deviation of a parameter divided by the square root of the number of effective samples
+
+$$MCSE = \frac{sd}{\sqrt{N_{eff}}}$$
+
+* **n_eff**: The number of effective samples. The effective sample size is an estimate of the sample size required to achieve the same level of precision if that sample was a simple random sample.
+
+* **Rhat** : In equilibrium, the distribution of samples from chains should be the same regardless of the initial starting values of the chains. When these are at or near 1, the chains have converged. Values greater than 1.1 indicate inadequate convergence.
+
+(resourse: https://github.com/stan-dev/cmdstan/blob/develop/src/cmdstan/stansummary.cpp#L119)
+
+
+```{r}
+paras1 <- c("s_age")
+for (i in 1:27){
+  para <- paste("r_age[", i, sep="")
+  para <- paste(para, "]", sep="")
+  paras1 <- c(paras1, para)
+}
+print(fit1,  pars = paras1, digits=4)
+```
+
+n_eff is quite high. Even if I set this number higher, It showed much higher one. I can say this model is not nice.
+
+## Graph after MCMC
+
+```{r}
+plot_graph(fit1)
+```
+ 
+This graph is almost same as initial graph. We can say that this model does not do anything. 
+Next, we will add a constant beta to make a better model.
+
+
+# Model 2 (Considering only age with beta)
+
+I define the first bayesian model cosidering only age below. 
+
+$$HR[i] \sim \mathrm{Binomial}(AB[i],p[i])$$
+$$p[i] = \mathrm{Logistic}(\beta+r_{age}[age[i]])$$ 
+
+$$\mathrm{where} \quad i = 1, 2, ..., N$$
+$$r_{age}[j] \sim \mathrm{Normal}(0,s_{age}) $$
+$$\mathrm{where} \quad j = 1, 2, ..., N_{age}$$
+
+This time, I changed the probability of homeruns at age $p_i$ follows logistic function with constant $\beta$ and the variable depending on the age of the player $r_{age}$.
+
+
+```{r}
+# Model
+
+# The data block reads external information.
+# data {
+#     int N;
+#     int N_age;
+#     int HR[N];
+#     int AB[N];
+#     int age[N];
+# }
+# 
+# The parameters block defines the sampling space.
+# parameters {
+#     real beta;            # float
+#     real<lower=0> s_age;
+#     vector[N_age] r_age;
+# }
+# 
+# The transformed parameters block allows for parameter processing before the posterior is computed.
+# transformed parameters {
+#     vector[N] p;
+# 
+#     for (i in 1:N)
+#         p[i] = inv_logit(beta + r_age[age[i]]);
+# }
+# 
+# In the model block we define our posterior distributions.
+# model {
+#     r_age ~ normal(0, s_age);
+#     HR ~ binomial(AB, p);
+# }
+# 
+# The generated quantities block allows for postprocessing.
+# generated quantities {
+#     real p_age[N_age];
+#     for (i in 1:N_age)
+#         p_age[i] = inv_logit(beta + r_age[i]);
+# }
+```
+
+
+
+```{r model_2}
+fit2 <- stan(file = "model_2.stan", data = my.data, 
+            chains = my.chains, warmup = my.warmup, iter = my.iter,
+             cores = 2, refresh = my.refresh)
+```
+
+
+## Summary 2 
+
+Now we can print the results of our model.
+
+```{r}
+list_of_draws <- rstan::extract(fit2)
+print(names(list_of_draws))
+```
+
+
+```{r}
+paras <- c("beta", "s_age")
+for (i in 1:27){
+  para <- paste("r_age[", i, sep="")
+  para <- paste(para, "]", sep="")
+  paras <- c(paras, para)
+}
+print(fit2,  pars = paras, digits=4)
+```
+
+
+## Graph after MCMC
+
+```{r}
+plot_graph(fit2)
+```
+
+We have solved the third problem I mentioned before. Although we saw that 19-year-old players can bring a lot of homeruns and 45-year-old players can bring no homeruns at all because of the lack of data, now we predict that the number of homeruns stay at the similar level of near age. However, other than these specific ages, we still get almost same distribution. 
+
+
+# Model 3 (considering time series)
+
+$$HR[i] \sim \mathrm{Binomial}(AB[i], p[i])$$
+$$p[i] = \mathrm{Logistic}(\beta + r_{age}[age[i]])$$
+$$\mathrm{where} \quad i = 1, 2, ..., N$$
+
+$$r_{age}[j] \sim \mathrm{Normal}(r_{age}[j-1], s_{age})$$
+$$\sum_{j} r_{age}[j] = 0$$
+
+$$\mathrm{where} \quad j = 1, 2, ..., N_{age}$$
+
+
+```{r}
+# Model
+# data {
+#     int N;
+#     int N_age;
+#     int HR[N];
+#     int AB[N];
+#     int age[N];
+# }
+# 
+# parameters {
+#     real beta;
+#     real<lower=0> s_age;
+#     vector[N_age] r_age;
+# }
+# 
+# transformed parameters {
+#     vector[N] p;
+# 
+#     for (i in 1:N)
+#         p[i] = inv_logit(beta + r_age[age[i]]);
+# }
+# 
+# model {
+#     r_age[1] ~ normal(-sum(r_age[2:N_age]), 0.001);
+#     r_age[2:N_age] ~ normal(r_age[1:(N_age-1)], s_age);
+#     HR ~ binomial(AB, p);
+# }
+# 
+# generated quantities {
+#     real p_age[N_age];
+#     for (i in 1:N_age)
+#         p_age[i] = inv_logit(beta + r_age[i]);
+# }
+```
+
+```{r model_3}
+fit3 <- stan(file = "model_3.stan", data = my.data, 
+             chains = my.chains, warmup = my.warmup, iter = my.iter,
+             cores = 2, refresh = my.refresh)
+```
+
+## Summary 3 (Diagnostics)
+
+```{r}
+print(fit3,  pars = paras, digits = 4)
+```
+
+```{r}
+plot_graph(fit3)
+```
+
+
+# Model Comparison
+
+```{r}
+p_age.summary1 <- summary(fit1, pars = c("p_age"),  probs = 0.5)$summary
+p_age.summary1 <- p_age.summary1[, "50%"]
+p_HR1 <- cbind(p_HR, p_age.summary1)
+
+p_age.summary2 <- summary(fit2, pars = c("p_age"),  probs = 0.5)$summary
+p_age.summary2 <- p_age.summary2[, "50%"]
+p_HR2 <- cbind(p_HR1, p_age.summary2)
+
+p_age.summary3 <- summary(fit3, pars = c("p_age"),  probs = 0.5)$summary
+p_age.summary3 <- p_age.summary3[, "50%"]
+p_HR3 <- cbind(p_HR2, p_age.summary3)
+colnames(p_HR3) <- c("age", "p_data","count", "model1", "model2", "model3")
+
+ggplot(p_HR3, aes(x = age)) + 
+  geom_point(aes(y = p_data), stat = "identity") + 
+  geom_line(aes(y = p_data), stat = "identity", color = "black") + 
+  geom_line(aes(y = model1), stat = "identity", color = "red", alpha = 0.3) + 
+  geom_line(aes(y = model2), stat = "identity", color = "red", alpha = 0.6) + 
+  geom_point(aes(y = model3), stat = "identity", color = "red", alpha = 0.9) + 
+  geom_line(aes(y = model3), stat = "identity", color = "red", alpha = 0.9)
+
+```
+
+
+### Marginal Likelihood
+
+Computing the (log) marginal likelihoods via the bridge_sampler function is now easy: we only need to pass the stanfit objects which contain all information necessary. I use silent = TRUE to suppress printing the number of iterations to the console
+
+```{r}
+# compute log marginal likelihood via bridge sampling for all models
+bridge1 <- bridge_sampler(fit1, silent = TRUE)
+bridge2 <- bridge_sampler(fit2, silent = TRUE)
+bridge3 <- bridge_sampler(fit3, silent = TRUE)
+
+print(bridge1)
+print(bridge2)
+print(bridge3)
+```
+
+### Bayes Factor
+
+To compare the null model and the alternative model, we can compute the Bayes factor by using the bf function. In our case, we compute BF01, that is, the Bayes factor which quantifies how much more likely the data are under the null versus the alternative model
+
+```{r}
+# compute Bayes factor
+BF1_2 <- bf(bridge2, bridge1)
+print(BF1_2)
+BF2_3 <- bf(bridge3, bridge2)
+print(BF2_3)
+```
+
+We can see each model gets better based on these bayes factor.
+
+
+
+
+
+# Diagnostic
+
+## Traceplot
+
+Trace plots are a time series of sampler iterations. 
+The trace plots show the value of a variable across the monitored iteractions of the MCMC chain.
+
+In particular I print both the chain without warmup (burn-in), the first one is the red one, while the second one is blue.
+
+```{r trace1 }
+traceplot(fit1, pars = c(paras1[1],  paras1[2]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[3],  paras1[4]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[5],  paras1[6]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[7],  paras1[8]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[9],  paras1[10]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[11], paras1[12]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[13], paras1[14]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[15], paras1[16]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[17], paras1[18]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[19], paras1[20]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[21], paras1[22]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[23], paras1[24]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[25], paras1[26]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit1, pars = c(paras1[27], paras1[28]), inc_warmup = FALSE, nrow = 2)
+```
+
+## Autocorrelation
+
+MCMC samples are dependent. This does not effect the validity of inference on the posterior if the samplers has time to explore the posterior distribution, but it does affect the efficiency of the sampler.
+
+In other words, highly correlated MCMC samplers requires more samples to produce the same level of Monte Carlo error for an estimate.
+
+If we have a sequence of random variables $X_1$, $X_2$, ...  that are separated in time, as we did
+with the introduction to Markov chains, we can also think of the concept of autocorrelation,
+correlation of $X_t$ with some past or future variable $X_{t-l}$. Formally,it is define as
+
+$$ACF (X_t, X_{t-l}) = \frac{\mathrm{Cov}(X_t, X_{t-l})}{\sqrt{\mathrm{Var}(X_t)\mathrm{Var}(X_t)}}$$
+
+If the sequence is stationary, so that the joint distribution of multiple Xs does not change
+with time shifts, then autocorrelation for two variables does not depend on the exact times
+$t$ and $t-l$, but rather on the distance between them, $l$. That is why the autocorrelation
+plots in the lesson on convergence of MCMC calculate autocorrelation in terms of lags.
+
+```{r}
+mcmc_acf_bar(fit1, pars = c(paras1[1],  paras1[2]),   lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[3],  paras1[4]),   lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[5],  paras1[6]),   lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[7],  paras1[8]),   lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[9],  paras1[10]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[11], paras1[12]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[13], paras1[14]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[15], paras1[16]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[17], paras1[18]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[19], paras1[20]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[21], paras1[22]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[23], paras1[24]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[25], paras1[26]),  lags = num.lag)
+mcmc_acf_bar(fit1, pars = c(paras1[27], paras1[28]),  lags = num.lag)
+```
+
+When the lag is small, the autocorrelation is relatively higher than those of bigger lags.
+
+## Traceplot (model2)
+
+```{r}
+traceplot(fit2, pars = c(paras[1],  paras[2]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[3],  paras[4]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[5],  paras[6]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[7],  paras[8]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[9],  paras[10]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[11], paras[12]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[13], paras[14]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[15], paras[16]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[17], paras[18]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[19], paras[20]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[21], paras[22]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[23], paras[24]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[25], paras[26]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = c(paras[27], paras[28]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit2, pars = paras[29],               inc_warmup = FALSE, nrow = 2)
+```
+
+## Autocorrelation (model2)
+
+```{r}
+mcmc_acf_bar(fit2, pars = c(paras[1],  paras[2]),   lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[3],  paras[4]),   lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[5],  paras[6]),   lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[7],  paras[8]),   lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[9],  paras[10]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[11], paras[12]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[13], paras[14]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[15], paras[16]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[17], paras[18]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[19], paras[20]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[21], paras[22]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[23], paras[24]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[25], paras[26]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = c(paras[27], paras[28]),  lags = num.lag)
+mcmc_acf_bar(fit2, pars = paras[29],                lags = num.lag)
+```
+
+## Traceplot (model3)
+
+```{r}
+traceplot(fit3, pars = c(paras[1],  paras[2]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[3],  paras[4]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[5],  paras[6]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[7],  paras[8]),  inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[9],  paras[10]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[11], paras[12]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[13], paras[14]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[15], paras[16]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[17], paras[18]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[19], paras[20]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[21], paras[22]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[23], paras[24]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[25], paras[26]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = c(paras[27], paras[28]), inc_warmup = FALSE, nrow = 2)
+traceplot(fit3, pars = paras[29],               inc_warmup = FALSE, nrow = 2)
+```
+
+## Autocorrelation (model3)
+
+```{r}
+mcmc_acf_bar(fit3, pars = c(paras[1],  paras[2]),   lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[3],  paras[4]),   lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[5],  paras[6]),   lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[7],  paras[8]),   lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[9],  paras[10]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[11], paras[12]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[13], paras[14]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[15], paras[16]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[17], paras[18]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[19], paras[20]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[21], paras[22]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[23], paras[24]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[25], paras[26]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = c(paras[27], paras[28]),  lags = num.lag)
+mcmc_acf_bar(fit3, pars = paras[29],                lags = num.lag)
+```
