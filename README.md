@@ -9,3 +9,7 @@ The purpose of my project is to predict the transition between ages of players a
 MLB (Major Leegue Baseball) dataset. You can find [here](http://www.seanlahman.com/baseball-archive/statistics/). 
 There is a big dataset that includes various information such as teams, players of each team, pitching, batting and so on. 
 I use only the batting and people datasets.
+
+## Method 
+I created 3 models
+1. 
